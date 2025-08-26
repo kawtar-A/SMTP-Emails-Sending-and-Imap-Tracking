@@ -26,14 +26,37 @@ from pytz import timezone
 
 # === CONFIG ===
 TEMPLATE_PATH = Path("newsletter_template.html")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+SENDER_EMAIL = st.secrets["SENDER_EMAIL"]
+APP_PASSWORD = st.secrets["APP_PASSWORD"]
+SPREADSHEET_ID = st.secrets["SPREADSHEET_ID"]
+GAS_TRACKING_URL = st.secrets["GAS_TRACKING_URL"]
 SERVICE_ACCOUNT_FILE = "config/GoogleAPI.json"
-GAS_TRACKING_URL = os.getenv("GAS_TRACKING_URL")
-SENDER_EMAIL = os.getenv("SENDER_EMAIL")
-APP_PASSWORD = os.getenv("APP_PASSWORD")
 SMTP_SERVER, SMTP_PORT = "smtp.gmail.com", 465
 SENDER_NAME = "Victoria Branson"
 BCC_EMAIL = "8150892@bcc.hubspot.com"
+
+import gspread
+from google.oauth2.service_account import Credentials
+
+def load_articles():
+    """Load top 5 articles from Google Sheet tab 'Newsletter Articles-Week1'."""
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
+    client = gspread.authorize(creds)
+    sheet = client.open_by_key(SPREADSHEET_ID)
+    ws = sheet.worksheet("Newsletter Articles-Week1")  # <- change if your tab name differs
+    records = ws.get_all_records()
+
+    # Expecting columns: Title, Subtitle, Img, Url
+    articles = []
+    for r in records[:5]:
+        articles.append({
+            "title": r.get("Title", ""),
+            "subtitle": r.get("Subtitle", ""),
+            "img": r.get("Img", "https://via.placeholder.com/120"),
+            "url": r.get("Url", "#")
+        })
+    return articles
 
 # === HELPERS ===
 def email_hash(addr): return hashlib.sha256(addr.lower().encode()).hexdigest()[:16]
@@ -46,13 +69,12 @@ def build_tracking_link(t, b, s, nid, sid, mid, e, to=""):
 
 # === STREAMLIT UI ===
 st.title("📬 Newsletter Sender App")
-st.markdown("Upload contact CSV, pick a vertical, and send personalized tracked emails.")
+st.markdown("Upload contact CSV, pick a vertical, preview newsletter, then send.")
 
 with st.sidebar:
     vertical_input = st.text_input("Vertical (e.g. Forestry)")
     batch_name = st.text_input("Batch Name", value="Newsletter_Batch")
     step = st.number_input("Sequence Step", min_value=1, value=1)
-    send_now = st.checkbox("Send emails now")
 
 contact_file = st.file_uploader("Upload contacts CSV", type="csv")
 
@@ -60,32 +82,34 @@ contact_file = st.file_uploader("Upload contacts CSV", type="csv")
 if not TEMPLATE_PATH.exists():
     st.error("Template file not found.")
     st.stop()
-
 html_template = TEMPLATE_PATH.read_text(encoding="utf-8")
 
-if contact_file and vertical_input and batch_name:
+# === Actions ===
+if vertical_input and contact_file:
     df = pd.read_csv(contact_file)
     st.success(f"Loaded {len(df)} contacts")
 
-    # Dummy article loading (replace with API or Google Sheet later)
-    articles = [
-        {"title": f"Story {i+1}", "subtitle": f"Subtitle {i+1}", "img": "https://via.placeholder.com/120", "url": "https://example.com"}
-        for i in range(5)
-    ]
+    # --- Buttons ---
+    preview_btn = st.button("🔍 Preview Newsletter")
+    send_btn = st.button("✉️ Send Emails")
 
-    preview_html = html_template.replace("{{vertical_name}}", vertical_input.title())
-    for i, art in enumerate(articles, 1):
-        preview_html = preview_html.replace(f"{{{{news{i}_title}}}}", art["title"])
-        preview_html = preview_html.replace(f"{{{{news{i}_subtitle}}}}", truncate(art["subtitle"]))
-        preview_html = preview_html.replace(f"{{{{news{i}_img}}}}", art["img"])
-        preview_html = preview_html.replace(f"{{{{news{i}_url}}}}", art["url"])
+    if preview_btn:
+        articles = load_articles()  # from GSheet function
+        preview_html = html_template.replace("{{vertical_name}}", vertical_input.title())
+        for i, art in enumerate(articles, 1):
+            preview_html = preview_html.replace(f"{{{{news{i}_title}}}}", art["title"])
+            preview_html = preview_html.replace(f"{{{{news{i}_subtitle}}}}", truncate(art["subtitle"]))
+            preview_html = preview_html.replace(f"{{{{news{i}_img}}}}", art["img"])
+            preview_html = preview_html.replace(f"{{{{news{i}_url}}}}", art["url"])
 
-    preview_html = preview_html.replace("{{prefs_link}}", "#")
-    preview_html = preview_html.replace("{{unsub_link}}", "#")
-    st.markdown("### Preview")
-    st.components.v1.html(preview_html, height=800, scrolling=True)
+        preview_html = preview_html.replace("{{prefs_link}}", "#")
+        preview_html = preview_html.replace("{{unsub_link}}", "#")
 
-    if send_now:
+        st.markdown("### Preview")
+        st.components.v1.html(preview_html, height=800, scrolling=True)
+
+    if send_btn:
+        articles = load_articles()
         server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
         server.login(SENDER_EMAIL, APP_PASSWORD)
         with server:
@@ -96,9 +120,14 @@ if contact_file and vertical_input and batch_name:
 
                 mid = make_msgid()
                 ehash = email_hash(email)
-                now = datetime.now(timezone("Africa/Casablanca")).strftime("%Y-%m-%d %H:%M:%S")
 
-                html = preview_html
+                # Build personalized HTML
+                html = html_template.replace("{{vertical_name}}", vertical_input.title())
+                for j, art in enumerate(articles, 1):
+                    html = html.replace(f"{{{{news{j}_title}}}}", art["title"])
+                    html = html.replace(f"{{{{news{j}_subtitle}}}}", truncate(art["subtitle"]))
+                    html = html.replace(f"{{{{news{j}_img}}}}", art["img"])
+                    html = html.replace(f"{{{{news{j}_url}}}}", art["url"])
                 html = html.replace("{{prefs_link}}", build_tracking_link("prefs", batch_name, step, "nid", ehash, mid.strip("<>"), ehash))
                 html = html.replace("{{unsub_link}}", build_tracking_link("unsubscribe", batch_name, step, "nid", ehash, mid.strip("<>"), ehash))
                 html = html.replace("</body>", f"{build_open_pixel(batch_name, step, 'nid', ehash, mid.strip('<>'), ehash)}</body>")
@@ -122,3 +151,5 @@ if contact_file and vertical_input and batch_name:
                     st.error(f"❌ Failed: {email} → {e}")
 
                 time.sleep(0.3)
+
+
